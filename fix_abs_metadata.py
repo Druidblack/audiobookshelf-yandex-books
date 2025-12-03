@@ -274,6 +274,19 @@ def _normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+def strip_trailing_punct_for_search(title: str) -> str:
+    """
+    Убираем хвостовые знаки препинания в конце названия
+    для поискового запроса на FantLab.
+    Пример: 'Понедельник начинается в субботу!' -> 'Понедельник начинается в субботу'
+    """
+    if not title:
+        return ""
+    title = title.strip()
+    # Убираем один или несколько ! ? . … , : ; в конце
+    title = re.sub(r"[!?.…,:;]+$", "", title).strip()
+    return title
+
 
 def search_fantlab_book(
     session: requests.Session,
@@ -291,10 +304,16 @@ def search_fantlab_book(
       2) только title (author="")
     Возвращаем один «лучший» результат (сейчас просто первый из ответа).
     """
-    title = (title or "").strip()
-    author = (author or "") or ""
 
-    if not title:
+    original_title = (title or "").strip()
+    # Для запроса убираем хвостовые знаки препинания (! ? . … , : ;)
+    query_title = strip_trailing_punct_for_search(original_title)
+    if not query_title:
+        query_title = original_title
+
+    author = (author or "").strip()
+
+    if not query_title:
         return None
 
     def _do_request(params: Dict[str, str]) -> List[Dict[str, Any]]:
@@ -309,7 +328,7 @@ def search_fantlab_book(
     results: List[Dict[str, Any]] = []
     if author:
         params1 = {
-            "title": title,
+            "title": query_title,
             "author": author,
             "provider": provider,
         }
@@ -321,7 +340,7 @@ def search_fantlab_book(
     # 2) fallback: только title
     if not results:
         params2 = {
-            "title": title,
+            "title": query_title,
             "provider": provider,
         }
         try:
@@ -335,15 +354,18 @@ def search_fantlab_book(
 
     best = results[0]
 
-    norm_q = _normalize_text(title)
+    # Для грубой проверки похожести использует исходное название,
+    # чтобы не мешало удаление знаков препинания
+    norm_q = _normalize_text(original_title or query_title)
     norm_res = _normalize_text(str(best.get("title", "")))
     if norm_q and norm_res and norm_q not in norm_res and norm_res not in norm_q:
         print(
             f"  [FantLab] Внимание: название из FantLab '{best.get('title')}' "
-            f"сильно отличается от запроса '{title}'"
+            f"сильно отличается от запроса '{original_title or query_title}'"
         )
 
     return best
+
 
 
 def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -353,22 +375,32 @@ def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
     """
     updates: Dict[str, Any] = {}
 
+    # Подзаголовок (подзаголовок книги в ABS)
+    subtitle = result.get("subtitle")
+    if subtitle:
+        updates["subtitle"] = subtitle
+
+    # Описание
     desc = result.get("description")
     if desc:
         updates["description"] = desc
 
+    # Издатель
     publisher = result.get("publisher")
     if publisher:
         updates["publisher"] = publisher
 
+    # Год издания
     year = result.get("publishedYear")
     if year:
         updates["publishedYear"] = str(year)
 
+    # ISBN
     isbn = result.get("isbn")
     if isbn:
         updates["isbn"] = isbn
 
+    # Жанры
     genres = result.get("genres") or []
     if isinstance(genres, list) and genres:
         updates["genres"] = genres
