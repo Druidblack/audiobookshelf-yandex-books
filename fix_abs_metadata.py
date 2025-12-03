@@ -12,24 +12,19 @@ import requests
 # Можно не передавать флаги, а просто задать:
 #   ABS_BASE_URL=http://localhost:13378
 #   ABS_TOKEN=ВАШ_ТОКЕН
-#   ABS_DRY_RUN=1          (или TRUE/true/yes)
-#   ABS_USE_FANTLAB=1      (включить шаг с FantLab)
-#   ABS_FANTLAB_PROVIDER=fantlab   (имя провайдера в ABS)
+#   ABS_DRY_RUN=1  (или  TRUE/true/yes)
+#   ABS_USE_FANTLAB=1  (включить FantLab по умолчанию)
 #
 # Пример запуска:
 #   export ABS_BASE_URL="http://localhost:13378"
 #   export ABS_TOKEN="ВАШ_ТОКЕН"
 #   export ABS_DRY_RUN="1"
 #   export ABS_USE_FANTLAB="1"
-#   export ABS_FANTLAB_PROVIDER="fantlab"
 #   python fix_abs_metadata.py
 # ======================================================================
 
 ABS_BASE_URL_ENV = os.environ.get("ABS_BASE_URL", "http://192.168.1.161:16378")
-ABS_TOKEN_ENV = os.environ.get(
-    "ABS_TOKEN",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJrZXlJZCI6IjY1NThhZDE5LWM2MDUtNDE3Ni1iMjY2LTE3Y2QzNzE0NjE1MCIsIm5hbWUiOiI2NjY2IiwidHlwZSI6ImFwaSIsImlhdCI6MTc2NDc4ODMyOH0.3xd1NmYZXPvmrUA4CF5Eym0RsUg2VzzplBXDQcxvGuQ"
-)
+ABS_TOKEN_ENV = os.environ.get("ABS_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJrZXlJZCI6IjY1NThhZDE5LWM2MDUtNDE3Ni1iMjY2LTE3Y2QzNzE0NjE1MCIsIm5hbWUiOiI2NjY2IiwidHlwZSI6ImFwaSIsImlhdCI6MTc2NDc4ODMyOH0.3xd1NmYZXPvmrUA4CF5Eym0RsUg2VzzplBXDQcxvGuQ")
 
 ABS_DRY_RUN_ENV = os.environ.get("ABS_DRY_RUN", "0")
 DEFAULT_DRY_RUN = ABS_DRY_RUN_ENV.lower() in ("1", "true", "yes", "y", "on")
@@ -37,13 +32,11 @@ DEFAULT_DRY_RUN = ABS_DRY_RUN_ENV.lower() in ("1", "true", "yes", "y", "on")
 ABS_USE_FANTLAB_ENV = os.environ.get("ABS_USE_FANTLAB", "1")
 DEFAULT_USE_FANTLAB = ABS_USE_FANTLAB_ENV.lower() in ("1", "true", "yes", "y", "on")
 
-ABS_FANTLAB_PROVIDER_ENV = os.environ.get("ABS_FANTLAB_PROVIDER", "fantlab")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Исправление метаданных книг в Audiobookshelf "
-                    "на основе тегов аудиофайлов (+ опционально FantLab)"
+                    "на основе тегов аудиофайлов"
     )
     parser.add_argument(
         "--base-url",
@@ -77,22 +70,31 @@ def parse_args() -> argparse.Namespace:
               f"По умолчанию: {'включён' if DEFAULT_DRY_RUN else 'выключен'}, "
               "значение можно задать через ABS_DRY_RUN=0/1/true/false"),
     )
+
+    # Использование FantLab
+    parser.set_defaults(use_fantlab=DEFAULT_USE_FANTLAB)
     parser.add_argument(
         "--use-fantlab",
+        dest="use_fantlab",
         action="store_true",
-        default=DEFAULT_USE_FANTLAB,
-        help=("После исправления метаданных для книги выполнить match "
-              "на провайдера FantLab и применить его данные, КРОМЕ "
-              "названия и обложки (их вернём обратно). "
-              "По умолчанию берётся из ABS_USE_FANTLAB=0/1."),
+        help=("После исправления метаданных пробовать автоматически "
+              "подтянуть данные книги с провайдера FantLab через /api/search/books. "
+              f"По умолчанию: {'включён' if DEFAULT_USE_FANTLAB else 'выключен'}, "
+              "значение можно задать через ABS_USE_FANTLAB=0/1/true/false"),
+    )
+    parser.add_argument(
+        "--no-use-fantlab",
+        dest="use_fantlab",
+        action="store_false",
+        help="Отключить использование FantLab для текущего запуска.",
     )
     parser.add_argument(
         "--fantlab-provider",
-        default=ABS_FANTLAB_PROVIDER_ENV,
-        help=("Имя провайдера FantLab в ABS (строка для /api/items/<ID>/match). "
-              f"По умолчанию: {ABS_FANTLAB_PROVIDER_ENV!r} "
-              "или переменная ABS_FANTLAB_PROVIDER."),
+        default="fantlab",
+        help=("Имя провайдера метаданных для FantLab "
+              "(как настроено в Audiobookshelf, по умолчанию: 'fantlab')"),
     )
+
     return parser.parse_args()
 
 
@@ -104,7 +106,7 @@ def chunked(seq: List[Any], size: int):
 def build_session(base_url: str, token: Optional[str]) -> Tuple[requests.Session, str]:
     base_url = base_url.rstrip("/")
     session = requests.Session()
-    headers = {}
+    headers: Dict[str, str] = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     session.headers.update(headers)
@@ -177,7 +179,7 @@ def extract_authors_title_from_album(album: str) -> Tuple[List[str], Optional[st
     return [], None
 
 
-# --- Работа с API ----------------------------------------------------------
+# --- Работа с API Audiobookshelf ------------------------------------------
 
 
 def get_book_libraries(
@@ -247,10 +249,12 @@ def patch_book_metadata(
     """
     PATCH /api/items/<ID>/media c полем metadata.
     """
+    if not metadata_updates:
+        return
+
     payload = {"metadata": metadata_updates}
     if dry_run:
-        # Только логируем
-        print(f"  [DRY-RUN] PATCH /api/items/{item_id}/media -> {payload}")
+        # Ничего не отправляем — только логика просмотра.
         return
 
     resp = session.patch(f"{base_url}/api/items/{item_id}/media", json=payload)
@@ -260,72 +264,119 @@ def patch_book_metadata(
         print(f"  !!! Ошибка PATCH /items/{item_id}/media: {e} — {resp.text}")
 
 
-def patch_item_cover(
+# --- FantLab через /api/search/books --------------------------------------
+
+
+def _normalize_text(s: str) -> str:
+    """Упрощаем строку для грубого сравнения (убираем знаки, приводим к lower)."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^0-9a-zа-яё\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def search_fantlab_book(
     session: requests.Session,
     base_url: str,
-    item_id: str,
-    cover_path: str,
-    dry_run: bool = True,
-) -> None:
-    """
-    PATCH /api/items/<ID>/cover с полем cover (абсолютный путь к картинке).
-    """
-    if not cover_path:
-        return
-    payload = {"cover": cover_path}
-    if dry_run:
-        print(f"  [DRY-RUN] PATCH /api/items/{item_id}/cover -> {payload}")
-        return
-
-    resp = session.patch(f"{base_url}/api/items/{item_id}/cover", json=payload)
-    try:
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  !!! Ошибка PATCH /items/{item_id}/cover: {e} — {resp.text}")
-
-
-def match_item_with_provider(
-    session: requests.Session,
-    base_url: str,
-    item_id: str,
-    provider: str,
-    dry_run: bool = True,
+    title: str,
+    author: Optional[str],
+    provider: str = "fantlab",
 ) -> Optional[Dict[str, Any]]:
     """
-    POST /api/items/<ID>/match {"provider": "<provider>"}.
+    Ищем книгу в FantLab через:
+      GET /api/search/books?title=...&author=...&provider=fantlab
 
-    Возвращает JSON с полями:
-      {
-        "updated": true/false,
-        "libraryItem": { ... }
-      }
+    Делаем две попытки:
+      1) title + author (если author не пустой)
+      2) только title (author="")
+    Возвращаем один «лучший» результат (сейчас просто первый из ответа).
     """
-    if not provider:
-        print("  [FantLab] Провайдер не указан, пропускаем match.")
+    title = (title or "").strip()
+    author = (author or "") or ""
+
+    if not title:
         return None
 
-    url = f"{base_url}/api/items/{item_id}/match"
-    payload = {"provider": provider}
-
-    if dry_run:
-        print(f"  [DRY-RUN] POST {url} -> {payload}")
-        return None
-
-    try:
-        resp = session.post(url, json=payload)
+    def _do_request(params: Dict[str, str]) -> List[Dict[str, Any]]:
+        resp = session.get(f"{base_url}/api/search/books", params=params)
         resp.raise_for_status()
-    except Exception as e:
-        print(f"  [FantLab] Ошибка match для {item_id}: {e}")
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        return []
+
+    # 1) title + author
+    results: List[Dict[str, Any]] = []
+    if author:
+        params1 = {
+            "title": title,
+            "author": author,
+            "provider": provider,
+        }
+        try:
+            results = _do_request(params1)
+        except Exception as e:
+            print(f"  [FantLab] Ошибка запроса (title+author): {e}")
+
+    # 2) fallback: только title
+    if not results:
+        params2 = {
+            "title": title,
+            "provider": provider,
+        }
+        try:
+            results = _do_request(params2)
+        except Exception as e:
+            print(f"  [FantLab] Ошибка запроса (title only): {e}")
+            results = []
+
+    if not results:
         return None
 
-    try:
-        return resp.json()
-    except Exception:
-        print("  [FantLab] Не удалось распарсить JSON-ответ match")
-        return None
+    best = results[0]
+
+    norm_q = _normalize_text(title)
+    norm_res = _normalize_text(str(best.get("title", "")))
+    if norm_q and norm_res and norm_q not in norm_res and norm_res not in norm_q:
+        print(
+            f"  [FantLab] Внимание: название из FantLab '{best.get('title')}' "
+            f"сильно отличается от запроса '{title}'"
+        )
+
+    return best
 
 
-# --- Основная логика для отдельной книги ----------------------------------
+def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Строим dict для PATCH /items/<ID>/media/metadata на основе результата
+    FantLab. НЕ трогаем title и обложку.
+    """
+    updates: Dict[str, Any] = {}
+
+    desc = result.get("description")
+    if desc:
+        updates["description"] = desc
+
+    publisher = result.get("publisher")
+    if publisher:
+        updates["publisher"] = publisher
+
+    year = result.get("publishedYear")
+    if year:
+        updates["publishedYear"] = str(year)
+
+    isbn = result.get("isbn")
+    if isbn:
+        updates["isbn"] = isbn
+
+    genres = result.get("genres") or []
+    if isinstance(genres, list) and genres:
+        updates["genres"] = genres
+
+    return updates
+
+
+# --- Основная логика -------------------------------------------------------
 
 
 def process_book_item(
@@ -394,6 +445,7 @@ def process_book_item(
 
     # Authors (список авторов)
     new_authors_objs = [{"name": name} for name in new_authors]
+    # Можно просто перезаписать авторов — мы специально не пытаемся сохранить старые ID/slug
     if new_authors_objs:
         updates["authors"] = new_authors_objs
 
@@ -402,10 +454,12 @@ def process_book_item(
     if new_narrator and new_narrator != curr_narrator_name:
         updates["narrators"] = [new_narrator]
 
+    # Для FantLab/логов сохраняем новые значения
+    log_info["new_title"] = new_title
+    log_info["new_authors"] = ", ".join(new_authors) if new_authors else None
+    log_info["new_narrator"] = new_narrator
+
     return (updates or None), log_info
-
-
-# --- Основной скрипт -------------------------------------------------------
 
 
 def main() -> None:
@@ -413,11 +467,11 @@ def main() -> None:
     session, base_url = build_session(args.base_url, args.token)
 
     print("Используем настройки:")
-    print(f"  base_url        = {base_url!r}")
-    print(f"  token           = {'<указан>' if args.token else '<НЕ указан>'}")
-    print(f"  dry_run         = {args.dry_run}")
-    print(f"  use_fantlab     = {args.use_fantlab}")
-    print(f"  fantlab_provider= {args.fantlab_provider!r}")
+    print(f"  base_url       = {base_url!r}")
+    print(f"  token          = {'<указан>' if args.token else '<НЕ указан>'}")
+    print(f"  dry_run        = {args.dry_run}")
+    print(f"  use_fantlab    = {args.use_fantlab}")
+    print(f"  fantlab_provider = {args.fantlab_provider!r}")
     print()
 
     if not args.token:
@@ -455,107 +509,79 @@ def main() -> None:
                     continue
 
                 updates, info = process_book_item(item)
-                if updates is None:
+                if updates is None and not args.use_fantlab:
+                    # Ни изменений по тегам, ни FantLab — пропускаем
                     continue
 
                 total_touched += 1
-                item_id = info.get("item_id")
-                media = (item.get("media") or {})
-                original_cover = media.get("coverPath")
 
                 print(f"\nКнига: {info.get('path')}")
-                print(f"  ID: {item_id}")
+                print(f"  ID: {info.get('item_id')}")
                 print(f"  Album (из файла): {info.get('album')}")
                 print(f"  Artist (из файла, чтец?): {info.get('artist_tag')}")
                 print(f"  Старый title: {info.get('old_title')!r}")
                 print(f"  Старый author: {info.get('old_author')!r}")
                 print(f"  Старый narrator: {info.get('old_narrator')!r}")
 
-                new_title = updates.get("title", info.get("old_title"))
-                if "authors" in updates and updates["authors"]:
-                    new_author_str = ", ".join(a["name"] for a in updates["authors"])
-                else:
-                    new_author_str = info.get("old_author")
-
-                if "narrators" in updates and updates["narrators"]:
-                    new_narrator = updates["narrators"][0]
-                else:
-                    new_narrator = info.get("old_narrator")
+                new_title = info.get("new_title", info.get("old_title"))
+                new_author_str = info.get("new_authors", info.get("old_author"))
+                new_narrator = info.get("new_narrator", info.get("old_narrator"))
 
                 print(f"  Новый title: {new_title!r}")
                 print(f"  Новый author: {new_author_str!r}")
                 print(f"  Новый narrator: {new_narrator!r}")
 
-                # 1) применяем наши правки (как раньше)
-                patch_book_metadata(
-                    session,
-                    base_url,
-                    item_id=item_id,
-                    metadata_updates=updates,
-                    dry_run=args.dry_run,
-                )
-                total_updates += 1
+                # 1) Обновляем метаданные из тегов файла
+                if updates:
+                    patch_book_metadata(
+                        session,
+                        base_url,
+                        item_id=info["item_id"],
+                        metadata_updates=updates,
+                        dry_run=args.dry_run,
+                    )
+                    total_updates += 1
 
-                # 2) опционально — матчимся к FantLab
+                # 2) Опционально подтягиваем FantLab
                 if args.use_fantlab:
-                    total_fantlab += 1
-                    if args.dry_run:
-                        print(
-                            f"  [DRY-RUN][FantLab] Для книги {item_id} был бы вызван "
-                            f"match(provider={args.fantlab_provider!r}), "
-                            f"после чего название и обложка были бы откатены к "
-                            f"title={new_title!r}, cover={original_cover!r}"
-                        )
+                    search_title = new_title or info.get("old_title")
+                    search_author = new_author_str or info.get("old_author")
+
+                    fl_result = search_fantlab_book(
+                        session,
+                        base_url,
+                        title=search_title or "",
+                        author=search_author,
+                        provider=args.fantlab_provider,
+                    )
+                    if not fl_result:
+                        print("  [FantLab] Ничего не найдено для этого заголовка.")
                     else:
-                        print(f"  [FantLab] Match provider={args.fantlab_provider!r} ...")
-                        match_result = match_item_with_provider(
-                            session=session,
-                            base_url=base_url,
-                            item_id=item_id,
-                            provider=args.fantlab_provider,
-                            dry_run=False,
+                        print(
+                            "  [FantLab] Найдено соответствие: "
+                            f"{fl_result.get('title')!r} — {fl_result.get('author')!r}, "
+                            f"год: {fl_result.get('publishedYear')}, "
+                            f"жанры: {fl_result.get('genres')}"
                         )
-                        if not match_result:
-                            print("  [FantLab] Match не выполнился (ошибка/нет ответа).")
+                        fl_updates = build_fantlab_metadata_updates(fl_result)
+                        if fl_updates:
+                            print(f"  [FantLab] Обновляем поля: {list(fl_updates.keys())}")
+                            patch_book_metadata(
+                                session,
+                                base_url,
+                                item_id=info["item_id"],
+                                metadata_updates=fl_updates,
+                                dry_run=args.dry_run,
+                            )
+                            total_fantlab += 1
                         else:
-                            updated = match_result.get("updated")
-                            if not updated:
-                                print("  [FantLab] updated=False — провайдер ничего не изменил.")
-                            else:
-                                library_item = match_result.get("libraryItem") or {}
-                                matched_media = library_item.get("media") or {}
-                                fantlab_cover = matched_media.get("coverPath")
-
-                                # Откат названия
-                                if new_title:
-                                    print(f"  [FantLab] Откатываем title обратно на {new_title!r}")
-                                    patch_book_metadata(
-                                        session,
-                                        base_url,
-                                        item_id=item_id,
-                                        metadata_updates={"title": new_title},
-                                        dry_run=False,
-                                    )
-
-                                # Откат обложки
-                                if original_cover and fantlab_cover != original_cover:
-                                    print(
-                                        f"  [FantLab] Откатываем cover обратно на {original_cover}"
-                                    )
-                                    patch_item_cover(
-                                        session,
-                                        base_url,
-                                        item_id=item_id,
-                                        cover_path=original_cover,
-                                        dry_run=False,
-                                    )
-                                else:
-                                    print("  [FantLab] Обложку оставляем (не изменилась или исходной не было).")
+                            print("  [FantLab] В результате нет полей, которые нужно применить.")
 
         print(f"\nИтого по библиотеке {lib_name!r}:")
         print(f"  Книг с найденным 'Album': {total_touched}")
-        print(f"  Книг, для которых отправлен PATCH (или был бы в dry-run): {total_updates}")
-        print(f"  Книг, для которых запущен FantLab-match: {total_fantlab}")
+        print(f"  Книг, для которых отправлен PATCH по тегам (или был бы в dry-run): {total_updates}")
+        if args.use_fantlab:
+            print(f"  Книг, для которых применены метаданные FantLab: {total_fantlab}")
         print("")
 
 
