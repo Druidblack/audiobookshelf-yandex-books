@@ -12,7 +12,7 @@ import requests
 # Можно не передавать флаги, а просто задать:
 #   ABS_BASE_URL=http://localhost:13378
 #   ABS_TOKEN=ВАШ_ТОКЕН
-#   ABS_DRY_RUN=1  (или TRUE/true/yes)
+#   ABS_DRY_RUN=1  (или  TRUE/true/yes)
 #
 # Пример запуска:
 #   export ABS_BASE_URL="http://localhost:13378"
