@@ -3,6 +3,12 @@ import argparse
 import os
 import re
 from typing import List, Tuple, Dict, Any, Optional
+from io import BytesIO
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 import requests
 
@@ -407,6 +413,175 @@ def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
 
     return updates
 
+def get_image_size_from_bytes(data: bytes) -> Optional[Tuple[int, int]]:
+    if not data or Image is None:
+        return None
+    try:
+        with Image.open(BytesIO(data)) as im:
+            return im.size  # (width, height)
+    except Exception:
+        return None
+
+
+def get_image_size_from_url(session: requests.Session, url: str, timeout: int = 20) -> Optional[Tuple[int, int]]:
+    if not url or Image is None:
+        return None
+    try:
+        r = session.get(url, timeout=timeout)
+        r.raise_for_status()
+        return get_image_size_from_bytes(r.content)
+    except Exception:
+        return None
+
+
+def get_current_item_cover_size(
+    session: requests.Session,
+    base_url: str,
+    item_id: str,
+    timeout: int = 20,
+) -> Optional[Tuple[int, int]]:
+    """
+    Возвращает размер текущей обложки книги из ABS.
+    Если обложки нет — None.
+
+    Используем GET /api/items/<ID>/cover?raw=1
+    (в доках указано, что можно получать raw-обложку).
+    """
+    try:
+        r = session.get(
+            f"{base_url}/api/items/{item_id}/cover",
+            params={"raw": 1},
+            timeout=timeout,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return get_image_size_from_bytes(r.content)
+    except Exception:
+        return None
+
+
+def should_update_cover(current_size: Optional[Tuple[int, int]],
+                        new_size: Optional[Tuple[int, int]]) -> bool:
+    """
+    Решение об обновлении:
+      - если текущей обложки нет → обновляем
+      - если размеры неизвестны (нет Pillow / не смогли прочитать) → не рискуем
+      - иначе обновляем, когда новая больше по площади
+    """
+    if current_size is None:
+        return True
+
+    if current_size and new_size:
+        cw, ch = current_size
+        nw, nh = new_size
+        return (nw * nh) > (cw * ch)
+
+    return False
+
+
+def download_cover_from_url_to_item(
+    session: requests.Session,
+    base_url: str,
+    item_id: str,
+    cover_url: str,
+    dry_run: bool = True,
+) -> bool:
+    """
+    Просим ABS скачать обложку по URL.
+    POST /api/items/<ID>/cover { "url": ... }
+    """
+    if not cover_url:
+        return False
+
+    if dry_run:
+        print(f"  [DRY-RUN][Cover] POST /api/items/{item_id}/cover url={cover_url}")
+        return True
+
+    try:
+        r = session.post(
+            f"{base_url}/api/items/{item_id}/cover",
+            json={"url": cover_url},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {}
+        if data.get("success") is False:
+            print(f"  [Cover] ABS вернул success=false для {item_id}")
+            return False
+        return True
+    except Exception as e:
+        print(f"  [Cover] Ошибка загрузки обложки для {item_id}: {e}")
+        return False
+
+
+def maybe_update_cover_from_fantlab(
+    session: requests.Session,
+    base_url: str,
+    item_id: str,
+    fantlab_cover_url: Optional[str],
+    existing_cover_path: Optional[str] = None,
+    dry_run: bool = True,
+) -> None:
+    """
+    Если обложки нет или она меньше, чем у FantLab — обновляем обложку из FantLab.
+
+    ВАЖНО:
+    - existing_cover_path берём из item.media.coverPath.
+    - Если Pillow нет или размеры не удалось определить, мы НЕ считаем,
+      что обложки нет. В таком случае обновляем ТОЛЬКО если coverPath пуст.
+    """
+    if not fantlab_cover_url:
+        return
+
+    has_cover = bool(existing_cover_path)
+
+    # Если Pillow отсутствует — нельзя сравнить размеры.
+    # Тогда обновляем ТОЛЬКО когда обложки реально нет.
+    if Image is None:
+        if not has_cover:
+            print("  [Cover] Pillow не установлен и обложки нет — берем обложку FantLab.")
+            download_cover_from_url_to_item(
+                session, base_url, item_id, fantlab_cover_url, dry_run=dry_run
+            )
+        else:
+            print("  [Cover] Pillow не установлен, но обложка уже есть — пропуск.")
+        return
+
+    current_size = get_current_item_cover_size(session, base_url, item_id)
+    fantlab_size = get_image_size_from_url(session, fantlab_cover_url)
+
+    # Если coverPath пуст — точно нет обложки
+    if not has_cover:
+        print("  [Cover] У книги нет обложки — берем обложку FantLab.")
+        download_cover_from_url_to_item(
+            session, base_url, item_id, fantlab_cover_url, dry_run=dry_run
+        )
+        return
+
+    # Обложка есть, но размер не удалось определить — НЕ трогаем
+    if current_size is None or fantlab_size is None:
+        print("  [Cover] Обложка есть, но сравнить размеры не удалось — пропуск.")
+        return
+
+    print(
+        f"  [Cover] Текущая обложка: {current_size[0]}x{current_size[1]}, "
+        f"FantLab: {fantlab_size[0]}x{fantlab_size[1]}"
+    )
+
+    # Можно добавить маленький порог, чтобы избежать замен при равных размерах
+    cw, ch = current_size
+    nw, nh = fantlab_size
+    if (nw * nh) > (cw * ch) * 1.05:
+        print("  [Cover] Обложка FantLab заметно больше — обновляем.")
+        download_cover_from_url_to_item(
+            session, base_url, item_id, fantlab_cover_url, dry_run=dry_run
+        )
+    else:
+        print("  [Cover] Текущая обложка не хуже — оставляем.")
+
+
+
 
 # --- Основная логика -------------------------------------------------------
 
@@ -608,6 +783,19 @@ def main() -> None:
                             total_fantlab += 1
                         else:
                             print("  [FantLab] В результате нет полей, которые нужно применить.")
+
+                        # Обложка: если нет или меньше чем у FantLab — обновить
+                        media = item.get("media") or {}
+                        existing_cover_path = media.get("coverPath")
+
+                        maybe_update_cover_from_fantlab(
+                            session=session,
+                            base_url=base_url,
+                            item_id=info["item_id"],
+                            fantlab_cover_url=fl_result.get("cover"),
+                            existing_cover_path=existing_cover_path,
+                            dry_run=args.dry_run,
+                        )
 
         print(f"\nИтого по библиотеке {lib_name!r}:")
         print(f"  Книг с найденным 'Album': {total_touched}")
