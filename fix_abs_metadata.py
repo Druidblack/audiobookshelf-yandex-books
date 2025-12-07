@@ -4,6 +4,7 @@ import os
 import re
 import json
 import tempfile
+import time
 from typing import List, Tuple, Dict, Any, Optional
 from io import BytesIO
 
@@ -27,12 +28,17 @@ import requests
 #   ABS_CACHE_FILE=abs_metadata_state.json
 #   ABS_DISABLE_CACHE=1
 #
+# ИНТЕРВАЛ АВТОЗАПУСКА:
+#   ABS_RUN_INTERVAL_MINUTES=0  (0 = однократный запуск, >0 = запускать каждые N минут в бесконечном цикле)
+#
+#
 # Пример запуска:
 #   export ABS_BASE_URL="http://localhost:13378"
 #   export ABS_TOKEN="ВАШ_ТОКЕН"
 #   export ABS_DRY_RUN="1"
 #   export ABS_USE_FANTLAB="1"
 #   export ABS_CACHE_FILE="abs_metadata_state.json"
+#   export ABS_RUN_INTERVAL_MINUTES="30"
 #   python fix_abs_metadata.py
 # ======================================================================
 
@@ -51,6 +57,11 @@ DEFAULT_USE_FANTLAB = ABS_USE_FANTLAB_ENV.lower() in ("1", "true", "yes", "y", "
 ABS_CACHE_FILE_ENV = os.environ.get("ABS_CACHE_FILE", "abs_metadata_state.json")
 ABS_DISABLE_CACHE_ENV = os.environ.get("ABS_DISABLE_CACHE", "0")
 DEFAULT_DISABLE_CACHE = ABS_DISABLE_CACHE_ENV.lower() in ("1", "true", "yes", "y", "on")
+ABS_RUN_INTERVAL_MIN_ENV = os.environ.get("ABS_RUN_INTERVAL_MINUTES", "2")
+try:
+    DEFAULT_RUN_INTERVAL_MIN = int(ABS_RUN_INTERVAL_MIN_ENV)
+except ValueError:
+    DEFAULT_RUN_INTERVAL_MIN = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -382,7 +393,6 @@ def strip_trailing_punct_for_search(title: str) -> str:
     return title
 
 
-
 def search_fantlab_book(
     session: requests.Session,
     base_url: str,
@@ -706,28 +716,12 @@ def process_book_item(
     return (updates or None), log_info
 
 
-def main() -> None:
-    args = parse_args()
-    session, base_url = build_session(args.base_url, args.token)
-
-    use_cache = not args.disable_cache
-    state = load_state(args.cache_file) if use_cache else {"version": 1, "items": {}}
-
-    print("Используем настройки:")
-    print(f"  base_url       = {base_url!r}")
-    print(f"  token          = {'<указан>' if args.token else '<НЕ указан>'}")
-    print(f"  dry_run        = {args.dry_run}")
-    print(f"  use_fantlab    = {args.use_fantlab}")
-    print(f"  fantlab_provider = {args.fantlab_provider!r}")
-    print(f"  cache          = {'включен' if use_cache else 'выключен'}")
-    if use_cache:
-        print(f"  cache_file     = {args.cache_file!r}")
-    print()
-
-    if not args.token:
-        print("ВНИМАНИЕ: токен не указан (--token или ABS_TOKEN). "
-              "Если сервер требует авторизацию, запросы будут падать.\n")
-
+def run_once(args: argparse.Namespace,
+             session: requests.Session,
+             base_url: str,
+             state: Dict[str, Any],
+             use_cache: bool) -> None:
+    """Выполнить одну полную обработку всех библиотек."""
     libraries = get_book_libraries(session, base_url, args.library_id)
     if not libraries:
         print("Книжные библиотеки не найдены (mediaType=book).")
@@ -921,9 +915,52 @@ def main() -> None:
             print(f"  Книг, для которых применены метаданные FantLab: {total_fantlab}")
         print("")
 
-    # Сохраняем состояние только при реальном запуске
-    if use_cache and not args.dry_run:
-        save_state(args.cache_file, state)
+
+def main() -> None:
+    args = parse_args()
+    session, base_url = build_session(args.base_url, args.token)
+
+    use_cache = not args.disable_cache
+    state = load_state(args.cache_file) if use_cache else {"version": 1, "items": {}}
+
+    print("Используем настройки:")
+    print(f"  base_url       = {base_url!r}")
+    print(f"  token          = {'<указан>' if args.token else '<НЕ указан>'}")
+    print(f"  dry_run        = {args.dry_run}")
+    print(f"  use_fantlab    = {args.use_fantlab}")
+    print(f"  fantlab_provider = {args.fantlab_provider!r}")
+    print(f"  cache          = {'включен' if use_cache else 'выключен'}")
+    if use_cache:
+        print(f"  cache_file     = {args.cache_file!r}")
+    print(f"  run_interval   = {DEFAULT_RUN_INTERVAL_MIN} мин (ABS_RUN_INTERVAL_MINUTES)")
+    print()
+
+    if not args.token:
+        print("ВНИМАНИЕ: токен не указан (--token или ABS_TOKEN). "
+              "Если сервер требует авторизацию, запросы будут падать.\n")
+
+    interval_min = DEFAULT_RUN_INTERVAL_MIN
+
+    if interval_min <= 0:
+        # Однократный запуск (как и раньше)
+        run_once(args, session, base_url, state, use_cache)
+        if use_cache and not args.dry_run:
+            save_state(args.cache_file, state)
+    else:
+        print(f"Автоматический режим: скрипт будет выполняться каждые {interval_min} минут.")
+        iteration = 0
+        while True:
+            iteration += 1
+            print(f"\n===== Итерация {iteration} =====")
+            run_once(args, session, base_url, state, use_cache)
+            if use_cache and not args.dry_run:
+                save_state(args.cache_file, state)
+            print(f"\nОжидание {interval_min} минут до следующего запуска...")
+            try:
+                time.sleep(interval_min * 60)
+            except KeyboardInterrupt:
+                print("\nОстановлено пользователем (Ctrl+C). Выход.")
+                break
 
 
 if __name__ == "__main__":
