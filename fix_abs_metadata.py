@@ -467,10 +467,34 @@ def search_fantlab_book(
 def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
     """
     Строим dict для PATCH /items/<ID>/media/metadata на основе результата
-    FantLab. НЕ трогаем title и обложку.
+    FantLab.
+    Теперь также добавляем title и authors (если они есть в результате).
     """
     updates: Dict[str, Any] = {}
 
+    # --- НОВОЕ: title ---
+    fl_title = result.get("title")
+    if fl_title:
+        updates["title"] = fl_title
+
+    # --- НОВОЕ: authors ---
+    author_field = result.get("author") or result.get("authors")
+    author_names: List[str] = []
+
+    if isinstance(author_field, str):
+        author_names = _split_authors(author_field)
+    elif isinstance(author_field, list):
+        for a in author_field:
+            if isinstance(a, dict) and a.get("name"):
+                author_names.append(str(a["name"]).strip())
+            elif isinstance(a, str):
+                author_names.append(a.strip())
+
+    author_names = [n for n in (s.strip() for s in author_names) if n]
+    if author_names:
+        updates["authors"] = [{"name": name} for name in author_names]
+
+    # --- СТАРОЕ поведение: дополнительные поля ---
     subtitle = result.get("subtitle")
     if subtitle:
         updates["subtitle"] = subtitle
@@ -496,6 +520,7 @@ def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
         updates["genres"] = genres
 
     return updates
+
 
 
 # --- Обложки ---------------------------------------------------------------
