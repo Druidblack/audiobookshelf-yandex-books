@@ -347,6 +347,7 @@ def cleanup_title_markers(title: str) -> str:
     """
     title = remove_radioplay_marker(title or "")
     title = remove_trailing_story_marker(title or "")
+    title = remove_trailing_new_translation_marker(title or "")
     return title.strip()
 
 
@@ -366,6 +367,17 @@ def remove_trailing_story_marker(title: str) -> str:
     if not title:
         return ""
     return re.sub(r"\s*,\s*рассказ(?:ы)?\.?\s*$", "", title, flags=re.IGNORECASE).strip()
+
+def remove_trailing_new_translation_marker(title: str) -> str:
+    """
+    Убираем служебный хвост в конце названия:
+      '(новый перевод)'
+    (без учёта регистра, допускаем лишние пробелы)
+    """
+    if not title:
+        return ""
+    return re.sub(r"\(\s*новый\s+перевод\s*\)\s*$", "", title, flags=re.IGNORECASE).strip()
+
 
 
 def remove_radioplay_marker(title: str) -> str:
