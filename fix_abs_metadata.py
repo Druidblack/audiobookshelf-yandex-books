@@ -8,27 +8,26 @@ import time
 from typing import List, Tuple, Dict, Any, Optional
 from io import BytesIO
 
+import requests
+
 try:
     from PIL import Image
 except ImportError:
     Image = None
 
-import requests
-
 # ======================================================================
 # ПЕРЕМЕННЫЕ СРЕДЫ
 # ======================================================================
-# Можно не передавать флаги, а просто задать:
 #   ABS_BASE_URL=http://localhost:13378
 #   ABS_TOKEN=ВАШ_ТОКЕН
-#   ABS_DRY_RUN=1  (или TRUE/true/yes)
+#   ABS_DRY_RUN=1
 #   ABS_USE_FANTLAB=1
 #
-# КЕШ СОСТОЯНИЯ:
+# КЕШ:
 #   ABS_CACHE_FILE=abs_metadata_state.json
 #   ABS_DISABLE_CACHE=1
 #
-# ИНТЕРВАЛ АВТОЗАПУСКА:
+# ИНТЕРВАЛ:
 #   ABS_RUN_INTERVAL_MINUTES=0  (0 = однократный запуск)
 # ======================================================================
 
@@ -45,7 +44,7 @@ ABS_CACHE_FILE_ENV = os.environ.get("ABS_CACHE_FILE", "abs_metadata_state.json")
 ABS_DISABLE_CACHE_ENV = os.environ.get("ABS_DISABLE_CACHE", "0")
 DEFAULT_DISABLE_CACHE = ABS_DISABLE_CACHE_ENV.lower() in ("1", "true", "yes", "y", "on")
 
-ABS_RUN_INTERVAL_MIN_ENV = os.environ.get("ABS_RUN_INTERVAL_MINUTES", "2")
+ABS_RUN_INTERVAL_MIN_ENV = os.environ.get("ABS_RUN_INTERVAL_MINUTES", "60")
 try:
     DEFAULT_RUN_INTERVAL_MIN = int(ABS_RUN_INTERVAL_MIN_ENV)
 except ValueError:
@@ -55,20 +54,18 @@ except ValueError:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Исправление метаданных книг в Audiobookshelf "
-                    "на основе тегов аудиофайлов"
+                    "на основе тегов аудиофайлов + поиск метаданных у провайдеров"
     )
     parser.add_argument(
         "--base-url",
         default=ABS_BASE_URL_ENV,
         help="Базовый URL Audiobookshelf "
-             f"(по умолчанию: {ABS_BASE_URL_ENV!r} "
-             "или переменная окружения ABS_BASE_URL)",
+             f"(по умолчанию: {ABS_BASE_URL_ENV!r} или ABS_BASE_URL)",
     )
     parser.add_argument(
         "--token",
         default=ABS_TOKEN_ENV,
-        help="Bearer-токен Audiobookshelf "
-             "(по умолчанию из переменной ABS_TOKEN)",
+        help="Bearer-токен Audiobookshelf (по умолчанию из ABS_TOKEN)",
     )
     parser.add_argument(
         "--library-id",
@@ -85,42 +82,43 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         default=DEFAULT_DRY_RUN,
-        help=("Если указан — только показывать изменения (без PATCH). "
-              f"По умолчанию: {'включён' if DEFAULT_DRY_RUN else 'выключен'}, "
-              "значение можно задать через ABS_DRY_RUN=0/1/true/false"),
+        help=("Только показывать изменения (без PATCH). "
+              f"По умолчанию: {'включён' if DEFAULT_DRY_RUN else 'выключен'} "
+              "(ABS_DRY_RUN)"),
     )
 
-    # Использование FantLab
+    # Использование цепочки провайдеров
     parser.set_defaults(use_fantlab=DEFAULT_USE_FANTLAB)
     parser.add_argument(
         "--use-fantlab",
         dest="use_fantlab",
         action="store_true",
-        help=("После исправления метаданных пробовать автоматически "
-              "подтянуть данные книги через /api/search/books. "
-              f"По умолчанию: {'включён' if DEFAULT_USE_FANTLAB else 'выключен'}, "
-              "значение можно задать через ABS_USE_FANTLAB=0/1/true/false"),
+        help=("Включить поиск метаданных по провайдерам "
+              "FantLab → Google Books → Audible. "
+              f"По умолчанию: {'включён' if DEFAULT_USE_FANTLAB else 'выключен'} "
+              "(ABS_USE_FANTLAB)"),
     )
     parser.add_argument(
         "--no-use-fantlab",
         dest="use_fantlab",
         action="store_false",
-        help="Отключить использование FantLab для текущего запуска.",
+        help="Отключить использование провайдеров для текущего запуска.",
     )
+
     parser.add_argument(
         "--fantlab-provider",
         default="fantlab",
-        help=("Имя провайдера метаданных для FantLab "
-              "(как настроено в Audiobookshelf, по умолчанию: 'fantlab')"),
+        help="Имя провайдера метаданных FantLab в ABS (по умолчанию: 'fantlab')",
     )
-
-    # Fallback Google Books
     parser.add_argument(
         "--google-provider",
         default="google",
-        help=("Имя провайдера метаданных для Google Books "
-              "(как настроено в Audiobookshelf, по умолчанию: 'google'). "
-              "Используется как fallback, если FantLab не нашёл или результат не прошёл проверку."),
+        help="Имя провайдера метаданных Google Books в ABS (по умолчанию: 'google')",
+    )
+    parser.add_argument(
+        "--audible-provider",
+        default="audible",
+        help="Имя провайдера метаданных Audible в ABS (по умолчанию: 'audible')",
     )
 
     # Кеш состояния
@@ -135,8 +133,7 @@ def parse_args() -> argparse.Namespace:
         "--disable-cache",
         dest="disable_cache",
         action="store_true",
-        help=("Отключить кеширование для текущего запуска "
-              "(или ABS_DISABLE_CACHE=1)."),
+        help="Отключить кеширование для текущего запуска (или ABS_DISABLE_CACHE=1).",
     )
     parser.add_argument(
         "--enable-cache",
@@ -206,12 +203,11 @@ def get_item_state(state: Dict[str, Any], item_id: str) -> Dict[str, Any]:
     return item_state
 
 
-# --- Разбор строки альбома -------------------------------------------------
+# ======================================================================
+# ПАРСИНГ АВТОРОВ/НАЗВАНИЯ ИЗ ALBUM
+# ======================================================================
 
 def _split_authors(author_part: str) -> List[str]:
-    """
-    Делим строку авторов по запятым.
-    """
     author_part = author_part.strip()
     if not author_part:
         return []
@@ -268,7 +264,9 @@ def extract_authors_title_from_album(album: str) -> Tuple[List[str], Optional[st
     return [], None
 
 
-# --- Работа с API Audiobookshelf ------------------------------------------
+# ======================================================================
+# API AUDIOBOOKSHELF
+# ======================================================================
 
 def get_book_libraries(
     session: requests.Session,
@@ -282,7 +280,7 @@ def get_book_libraries(
 
     result = []
     for lib in libs:
-        if only_id and lib["id"] != only_id:
+        if only_id and lib.get("id") != only_id:
             continue
         if lib.get("mediaType") == "book":
             result.append(lib)
@@ -339,16 +337,52 @@ def patch_book_metadata(
         print(f"  !!! Ошибка PATCH /items/{item_id}/media: {e} — {resp.text}")
 
 
-# --- Поиск у провайдеров через /api/search/books ---------------------------
+# ======================================================================
+# ОЧИСТКА/НОРМАЛИЗАЦИЯ НАЗВАНИЙ
+# ======================================================================
+
+def remove_radioplay_marker(title: str) -> str:
+    if not title:
+        return ""
+    return re.sub(r"\(\s*радиоспектакль\s*\)", "", title, flags=re.IGNORECASE).strip()
+
+
+def remove_trailing_story_marker(title: str) -> str:
+    """
+    Убираем хвостовые ', рассказ' / ', рассказы'
+    """
+    if not title:
+        return ""
+    return re.sub(r"\s*,\s*рассказ(?:ы)?\.?\s*$", "", title, flags=re.IGNORECASE).strip()
+
+
+def remove_trailing_new_translation_marker(title: str) -> str:
+    """
+    Убираем хвостовой маркер '(новый перевод)'
+    """
+    if not title:
+        return ""
+    return re.sub(r"\(\s*новый\s+перевод\s*\)\s*$", "", title, flags=re.IGNORECASE).strip()
+
 
 def cleanup_title_markers(title: str) -> str:
-    """
-    Убираем несущественные служебные маркеры из названия.
-    """
-    title = remove_radioplay_marker(title or "")
-    title = remove_trailing_story_marker(title or "")
-    title = remove_trailing_new_translation_marker(title or "")
+    title = title or ""
+    title = remove_radioplay_marker(title)
+    title = remove_trailing_story_marker(title)
+    title = remove_trailing_new_translation_marker(title)
     return title.strip()
+
+
+def strip_trailing_punct_for_search(title: str) -> str:
+    """
+    Подготовка названия для поиска на провайдерах.
+    """
+    if not title:
+        return ""
+    title = cleanup_title_markers(title)
+    title = re.sub(r"\s{2,}", " ", title).strip()
+    title = re.sub(r"[!?.…,:;]+$", "", title).strip()
+    return title
 
 
 def _normalize_text(s: str) -> str:
@@ -358,52 +392,311 @@ def _normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
-def remove_trailing_story_marker(title: str) -> str:
+
+# ======================================================================
+# ЗАЩИТА ОТ НЕПРАВИЛЬНЫХ СОВПАДЕНИЙ ПО НАЗВАНИЮ
+# ======================================================================
+
+_TITLE_STOPWORDS = {
+    "книга", "том", "часть", "серия", "цикл",
+    "book", "volume", "part", "series"
+}
+
+
+def _title_word_tokens(s: str) -> List[str]:
+    s = cleanup_title_markers(s or "")
+    s = s.lower()
+    words = re.findall(r"[a-zа-яё]+", s, flags=re.IGNORECASE)
+    cleaned = []
+    for w in words:
+        w = w.lower().strip()
+        if len(w) < 2:
+            continue
+        if w in _TITLE_STOPWORDS:
+            continue
+        cleaned.append(w)
+    return cleaned
+
+
+def _title_number_tokens(s: str) -> List[str]:
+    s = cleanup_title_markers(s or "")
+    return re.findall(r"\d+", s)
+
+
+def is_title_compatible(reference_title: str, candidate_title: str) -> bool:
     """
-    Убираем служебные хвосты в конце названия:
-      ', рассказ' / ', рассказы'
-    (без учёта регистра, допускаем точку в конце)
+    Строгая проверка:
+    1) Если в reference есть цифры -> в candidate должны быть ТЕ ЖЕ цифры (как множество).
+    2) Слова reference должны почти полностью присутствовать в candidate (>= 0.85 покрытия).
+    3) Допускаем более мягкое совпадение подстрокой при отсутствии цифр.
     """
-    if not title:
-        return ""
-    return re.sub(r"\s*,\s*рассказ(?:ы)?\.?\s*$", "", title, flags=re.IGNORECASE).strip()
+    ref = (reference_title or "").strip()
+    cand = (candidate_title or "").strip()
 
-def remove_trailing_new_translation_marker(title: str) -> str:
+    if not ref or not cand:
+        return False
+
+    ref_nums = _title_number_tokens(ref)
+    cand_nums = _title_number_tokens(cand)
+
+    if ref_nums:
+        if not cand_nums:
+            return False
+        if set(ref_nums) != set(cand_nums):
+            return False
+
+    ref_words = _title_word_tokens(ref)
+    cand_words = set(_title_word_tokens(cand))
+
+    ref_norm = _normalize_text(ref)
+    cand_norm = _normalize_text(cand)
+
+    if len(ref_words) <= 1:
+        if ref_norm and cand_norm and (ref_norm in cand_norm or cand_norm in ref_norm):
+            return True
+        return False
+
+    hit = sum(1 for w in ref_words if w in cand_words)
+    coverage = hit / max(1, len(ref_words))
+
+    if coverage >= 0.85:
+        return True
+
+    if ref_norm and cand_norm and ref_norm in cand_norm:
+        if not ref_nums and coverage >= 0.70:
+            return True
+
+    return False
+
+
+# ======================================================================
+# ДОСТАВАНИЕ АВТОРОВ И БАЗОВАЯ (СТАРАЯ) ПРОВЕРКА АВТОРОВ
+# ======================================================================
+# ВАЖНО: эти функции оставлены как отдельный слой.
+# Мы НЕ меняем их логику и добавляем новые вариативные функции ниже.
+
+def _normalize_author_name(name: str) -> str:
+    name = (name or "").strip().lower()
+    name = re.sub(r"[^a-zа-яё\s]+", " ", name)
+    name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+
+def extract_author_names_from_result(result: Dict[str, Any]) -> List[str]:
     """
-    Убираем служебный хвост в конце названия:
-      '(новый перевод)'
-    (без учёта регистра, допускаем лишние пробелы)
+    Достаём авторов из результата провайдера:
+      - author (str)
+      - authors (list[str] или list[dict{name}])
     """
-    if not title:
-        return ""
-    return re.sub(r"\(\s*новый\s+перевод\s*\)\s*$", "", title, flags=re.IGNORECASE).strip()
+    author_field = result.get("author") or result.get("authors")
+    author_names: List[str] = []
+
+    if isinstance(author_field, str):
+        author_names = _split_authors(author_field)
+    elif isinstance(author_field, list):
+        for a in author_field:
+            if isinstance(a, dict) and a.get("name"):
+                author_names.append(str(a["name"]).strip())
+            elif isinstance(a, str):
+                author_names.append(a.strip())
+
+    return [n for n in (s.strip() for s in author_names) if n]
 
 
-
-def remove_radioplay_marker(title: str) -> str:
+def is_author_compatible(search_author: Optional[str], result: Dict[str, Any]) -> bool:
     """
-    Убираем служебную пометку '(радиоспектакль)' из названия.
+    Требование:
+      автор найденной книги должен совпадать с автором, используемым для поиска.
+
+    Реализация:
+      - если search_author пустой -> True (не блокируем)
+      - сравниваем множества нормализованных авторов;
+        считаем совпадением, если все авторы поиска присутствуют в результате
+        (подмножество).
     """
-    if not title:
-        return ""
-    return re.sub(r"\(радиоспектакль\)", "", title, flags=re.IGNORECASE).strip()
+    if not search_author:
+        return True
+
+    search_list = _split_authors(str(search_author))
+    search_set = {_normalize_author_name(a) for a in search_list if _normalize_author_name(a)}
+    if not search_set:
+        return True
+
+    result_list = extract_author_names_from_result(result)
+    result_set = {_normalize_author_name(a) for a in result_list if _normalize_author_name(a)}
+    if not result_set:
+        return False
+
+    return search_set.issubset(result_set)
 
 
-def strip_trailing_punct_for_search(title: str) -> str:
-    if not title:
-        return ""
+def provider_result_is_safe(reference_title: str,
+                            search_author: Optional[str],
+                            result: Dict[str, Any],
+                            label: str) -> bool:
+    """
+    СТАРАЯ safety-проверка (оставлена без изменения).
+    """
+    cand_title = str(result.get("title") or "").strip()
+    if not cand_title:
+        print(f"  [{label}] У результата нет title — пропуск.")
+        return False
 
-    title = cleanup_title_markers(title)
+    ok_title = is_title_compatible(reference_title, cand_title)
+    if not ok_title:
+        print(
+            f"  [{label}] Подозрительное совпадение по названию. "
+            f"ABS: {reference_title!r} | {label}: {cand_title!r}. "
+            f"Метаданные НЕ применяем."
+        )
+        return False
 
-    # Схлопываем возможные двойные пробелы
-    title = re.sub(r"\s{2,}", " ", title).strip()
+    ok_author = is_author_compatible(search_author, result)
+    if not ok_author:
+        res_auth = result.get("author") or result.get("authors")
+        print(
+            f"  [{label}] Подозрительное совпадение по автору. "
+            f"Ищем: {search_author!r} | {label}: {res_auth!r}. "
+            f"Метаданные НЕ применяем."
+        )
+        return False
 
-    # Убираем хвостовые знаки препинания
-    title = re.sub(r"[!?.…,:;]+$", "", title).strip()
-
-    return title
+    return True
 
 
+# ======================================================================
+# НОВОЕ: ВАРИАТИВНАЯ ПРОВЕРКА АВТОРОВ (ДОБАВЛЕНИЕ БЕЗ ИЗМЕНЕНИЯ СТАРЫХ ФУНКЦИЙ)
+# ======================================================================
+
+_PATRONYMIC_SUFFIXES = (
+    "ович", "евич", "вич",
+    "овна", "евна", "вна",
+    "ична", "инич", "инична",
+)
+
+
+def _author_tokens(name: str) -> List[str]:
+    """
+    Токены имени автора без учета регистра, пунктуации и порядка слов.
+    """
+    name = (name or "").strip().lower()
+    tokens = re.findall(r"[a-zа-яё]+", name, flags=re.IGNORECASE)
+    return [t for t in tokens if len(t) > 1]
+
+
+def _is_patronymic_token(token: str) -> bool:
+    t = (token or "").lower()
+    return any(t.endswith(suf) for suf in _PATRONYMIC_SUFFIXES)
+
+
+def _core_author_set(tokens: List[str]) -> set:
+    """
+    Убираем отчества по эвристике суффиксов.
+    Если после удаления пусто — возвращаем исходный набор.
+    """
+    s = set(tokens or [])
+    core = {t for t in s if not _is_patronymic_token(t)}
+    return core if core else s
+
+
+def author_name_matches_variative(search_name: str, candidate_name: str) -> bool:
+    """
+    Вариативное сравнение одного автора:
+    - 'Гейман Нил' == 'Нил Гейман'
+    - 'Алексей Викторович Иванов' ~ 'Алексей Иванов'
+    """
+    s_tokens = _author_tokens(search_name)
+    c_tokens = _author_tokens(candidate_name)
+
+    if not s_tokens or not c_tokens:
+        return False
+
+    s_core = _core_author_set(s_tokens)
+    c_core = _core_author_set(c_tokens)
+
+    inter = s_core & c_core
+    if not inter:
+        return False
+
+    # Главное правило: один набор должен покрывать другой
+    # (переживает отсутствие отчества).
+    if s_core.issubset(c_core) or c_core.issubset(s_core):
+        return True
+
+    # Если в поиске 2+ смысловых токена — допускаем высокий процент совпадения
+    if len(s_core) >= 2:
+        overlap = len(inter) / max(1, len(s_core))
+        return overlap >= 0.8
+
+    # Если остался 1 токен — требуем его наличия
+    only = next(iter(s_core))
+    return only in c_core
+
+
+def is_author_compatible_variative(search_author: Optional[str], result: Dict[str, Any]) -> bool:
+    """
+    Вариативная проверка списка авторов книги:
+    - порядок соавторов не важен;
+    - каждый автор из search должен найти соответствие в result.
+    """
+    if not search_author:
+        return True
+
+    search_list = _split_authors(str(search_author))
+    search_list = [a for a in (s.strip() for s in search_list) if a]
+    if not search_list:
+        return True
+
+    result_list = extract_author_names_from_result(result)
+    if not result_list:
+        return False
+
+    for s_name in search_list:
+        if not any(author_name_matches_variative(s_name, c_name) for c_name in result_list):
+            return False
+
+    return True
+
+
+def provider_result_is_safe_variative(reference_title: str,
+                                      search_author: Optional[str],
+                                      result: Dict[str, Any],
+                                      label: str) -> bool:
+    """
+    Новый вариант safety-проверки:
+    - проверка названия остается прежней (is_title_compatible)
+    - проверка автора — вариативная
+    """
+    cand_title = str(result.get("title") or "").strip()
+    if not cand_title:
+        print(f"  [{label}] У результата нет title — пропуск.")
+        return False
+
+    ok_title = is_title_compatible(reference_title, cand_title)
+    if not ok_title:
+        print(
+            f"  [{label}] Подозрительное совпадение по названию. "
+            f"ABS: {reference_title!r} | {label}: {cand_title!r}. "
+            f"Метаданные НЕ применяем."
+        )
+        return False
+
+    ok_author = is_author_compatible_variative(search_author, result)
+    if not ok_author:
+        res_auth = result.get("author") or result.get("authors")
+        print(
+            f"  [{label}] Подозрительное совпадение по автору. "
+            f"Ищем: {search_author!r} | {label}: {res_auth!r}. "
+            f"Метаданные НЕ применяем."
+        )
+        return False
+
+    return True
+
+
+# ======================================================================
+# ПОИСК КНИГ У ПРОВАЙДЕРОВ ЧЕРЕЗ ABS
+# ======================================================================
 
 def search_fantlab_book(
     session: requests.Session,
@@ -413,7 +706,9 @@ def search_fantlab_book(
     provider: str = "fantlab",
 ) -> Optional[Dict[str, Any]]:
     """
-    GET /api/search/books?title=...&author=...&provider=<provider>
+    Универсальный поиск через:
+      GET /api/search/books?title=...&author=...&provider=<provider>
+
     1) title+author
     2) title
     Возвращаем первый результат.
@@ -452,147 +747,25 @@ def search_fantlab_book(
     if not results:
         return None
 
-    best = results[0]
-
-    norm_q = _normalize_text(original_title or query_title)
-    norm_res = _normalize_text(str(best.get("title", "")))
-    if norm_q and norm_res and norm_q not in norm_res and norm_res not in norm_q:
-        print(
-            f"  [{provider}] Внимание: название '{best.get('title')}' "
-            f"сильно отличается от запроса '{original_title or query_title}'"
-        )
-
-    return best
+    return results[0]
 
 
-# --- НОВОЕ: защита от неправильных совпадений ------------------------------
-
-_TITLE_STOPWORDS = {
-    "книга", "том", "часть", "серия", "цикл",
-    "book", "volume", "part", "series"
-}
-
-
-def _title_word_tokens(s: str) -> List[str]:
-    s = cleanup_title_markers(s or "")
-    s = s.lower()
-    words = re.findall(r"[a-zа-яё]+", s, flags=re.IGNORECASE)
-    cleaned = []
-    for w in words:
-        w = w.lower().strip()
-        if len(w) < 2:
-            continue
-        if w in _TITLE_STOPWORDS:
-            continue
-        cleaned.append(w)
-    return cleaned
-
-
-
-def _title_number_tokens(s: str) -> List[str]:
-    s = cleanup_title_markers(s or "")
-    return re.findall(r"\d+", s)
-
-
-
-def is_title_compatible(reference_title: str, candidate_title: str) -> bool:
-    """
-    Строгая проверка:
-    1) Если в reference есть цифры -> в candidate должны быть ТЕ ЖЕ цифры (как множество).
-       Иначе считаем сомнительным совпадением.
-    2) Слова reference должны почти полностью присутствовать в candidate.
-       По умолчанию требуем >= 0.85 покрытия.
-    3) Дополнительно допускаем совпадение по "подстроке" нормализованных строк.
-    """
-    ref = (reference_title or "").strip()
-    cand = (candidate_title or "").strip()
-
-    if not ref or not cand:
-        return False
-
-    ref_nums = _title_number_tokens(ref)
-    cand_nums = _title_number_tokens(cand)
-
-    if ref_nums:
-        if not cand_nums:
-            return False
-        if set(ref_nums) != set(cand_nums):
-            return False
-
-    ref_words = _title_word_tokens(ref)
-    cand_words = set(_title_word_tokens(cand))
-
-    # Если слишком мало слов, опираемся на нормализованную подстроку + цифры
-    ref_norm = _normalize_text(ref)
-    cand_norm = _normalize_text(cand)
-
-    if len(ref_words) <= 1:
-        if ref_norm and cand_norm and (ref_norm in cand_norm or cand_norm in ref_norm):
-            return True
-        # при наличии цифр это уже проверено выше
-        return False
-
-    hit = sum(1 for w in ref_words if w in cand_words)
-    coverage = hit / max(1, len(ref_words))
-
-    # более строгий порог
-    if coverage >= 0.85:
-        return True
-
-    # усиление через подстроку
-    if ref_norm and cand_norm and ref_norm in cand_norm:
-        # если цифр нет, можем разрешить чуть менее полное словесное покрытие
-        if not ref_nums and coverage >= 0.70:
-            return True
-
-    return False
-
-
-def provider_result_is_safe(reference_title: str, result: Dict[str, Any], label: str) -> bool:
-    cand_title = str(result.get("title") or "").strip()
-    if not cand_title:
-        print(f"  [{label}] У результата нет title — пропуск.")
-        return False
-
-    ok = is_title_compatible(reference_title, cand_title)
-    if not ok:
-        print(
-            f"  [{label}] Подозрительное совпадение по названию. "
-            f"ABS: {reference_title!r} | {label}: {cand_title!r}. "
-            f"Метаданные НЕ применяем."
-        )
-    return ok
-
-
-# --- Применение метаданных провайдера -------------------------------------
+# ======================================================================
+# ПРИМЕНЕНИЕ МЕТАДАННЫХ ПРОВАЙДЕРА
+# ======================================================================
 
 def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
     """
     Унифицированный сбор метаданных из результата /api/search/books
-    (FantLab/Google Books и др.).
-    Может применить title и authors, если они присутствуют в ответе.
+    (FantLab/Google Books/Audible и др.).
     """
     updates: Dict[str, Any] = {}
 
-    # title
     fl_title = result.get("title")
     if fl_title:
         updates["title"] = fl_title
 
-    # authors
-    author_field = result.get("author") or result.get("authors")
-    author_names: List[str] = []
-
-    if isinstance(author_field, str):
-        author_names = _split_authors(author_field)
-    elif isinstance(author_field, list):
-        for a in author_field:
-            if isinstance(a, dict) and a.get("name"):
-                author_names.append(str(a["name"]).strip())
-            elif isinstance(a, str):
-                author_names.append(a.strip())
-
-    author_names = [n for n in (s.strip() for s in author_names) if n]
+    author_names = extract_author_names_from_result(result)
     if author_names:
         updates["authors"] = [{"name": name} for name in author_names]
 
@@ -623,7 +796,9 @@ def build_fantlab_metadata_updates(result: Dict[str, Any]) -> Dict[str, Any]:
     return updates
 
 
-# --- Обложки ---------------------------------------------------------------
+# ======================================================================
+# ОБЛОЖКИ
+# ======================================================================
 
 def get_image_size_from_bytes(data: bytes) -> Optional[Tuple[int, int]]:
     if not data or Image is None:
@@ -701,11 +876,11 @@ def maybe_update_cover_from_fantlab(
     session: requests.Session,
     base_url: str,
     item_id: str,
-    fantlab_cover_url: Optional[str],
+    provider_cover_url: Optional[str],
     existing_cover_path: Optional[str] = None,
     dry_run: bool = True,
 ) -> None:
-    if not fantlab_cover_url:
+    if not provider_cover_url:
         return
 
     has_cover = bool(existing_cover_path)
@@ -714,33 +889,35 @@ def maybe_update_cover_from_fantlab(
         if not has_cover:
             print("  [Cover] Pillow не установлен и обложки нет — берем обложку провайдера.")
             download_cover_from_url_to_item(
-                session, base_url, item_id, fantlab_cover_url, dry_run=dry_run
+                session, base_url, item_id, provider_cover_url, dry_run=dry_run
             )
         return
 
     current_size = get_current_item_cover_size(session, base_url, item_id)
-    fantlab_size = get_image_size_from_url(session, fantlab_cover_url)
+    provider_size = get_image_size_from_url(session, provider_cover_url)
 
     if not has_cover:
         print("  [Cover] У книги нет обложки — берем обложку провайдера.")
         download_cover_from_url_to_item(
-            session, base_url, item_id, fantlab_cover_url, dry_run=dry_run
+            session, base_url, item_id, provider_cover_url, dry_run=dry_run
         )
         return
 
-    if current_size is None or fantlab_size is None:
+    if current_size is None or provider_size is None:
         return
 
     cw, ch = current_size
-    nw, nh = fantlab_size
+    nw, nh = provider_size
     if (nw * nh) > (cw * ch) * 1.05:
         print("  [Cover] Обложка провайдера заметно больше — обновляем.")
         download_cover_from_url_to_item(
-            session, base_url, item_id, fantlab_cover_url, dry_run=dry_run
+            session, base_url, item_id, provider_cover_url, dry_run=dry_run
         )
 
 
-# --- Вспомогательное: получить текущие Album/Artist из файлов --------------
+# ======================================================================
+# ВСПОМОГАТЕЛЬНОЕ: ALBUM/ARTIST ИЗ ФАЙЛОВ
+# ======================================================================
 
 def extract_file_album_artist(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     media = item.get("media") or {}
@@ -759,7 +936,9 @@ def extract_file_album_artist(item: Dict[str, Any]) -> Tuple[Optional[str], Opti
     return meta_tags.get("tagAlbum") or None, meta_tags.get("tagArtist") or None
 
 
-# --- Основная логика -------------------------------------------------------
+# ======================================================================
+# ОСНОВНАЯ ЛОГИКА: ИСПРАВЛЕНИЕ ПО ТЕГАМ
+# ======================================================================
 
 def process_book_item(
     item: Dict[str, Any],
@@ -841,7 +1020,9 @@ def process_book_item(
     return (updates or None), log_info
 
 
-# --- Запуск ---------------------------------------------------------------
+# ======================================================================
+# ОСНОВНОЙ ПРОХОД: ТЕГИ + ПРОВАЙДЕРЫ
+# ======================================================================
 
 def run_once(args: argparse.Namespace,
              session: requests.Session,
@@ -871,8 +1052,9 @@ def run_once(args: argparse.Namespace,
         total_touched = 0
         total_fantlab = 0
         total_google = 0
+        total_audible = 0
         total_tags_skipped = 0
-        total_fantlab_skipped = 0
+        total_provider_skipped = 0
 
         for batch in chunked(item_ids, args.batch_size):
             items = batch_get_items(session, base_url, batch)
@@ -920,6 +1102,7 @@ def run_once(args: argparse.Namespace,
                 else:
                     total_tags_skipped += 1
 
+                    # Минимальная info для провайдеров
                     media = item.get("media") or {}
                     meta = media.get("metadata") or {}
                     authors_meta = meta.get("authors") or []
@@ -943,7 +1126,7 @@ def run_once(args: argparse.Namespace,
 
                 total_touched += 1
 
-                # Текущие значения для поиска
+                # Значения для поиска
                 new_title = info.get("new_title", info.get("old_title"))
                 new_author_str = info.get("new_authors", info.get("old_author"))
                 new_narrator = info.get("new_narrator", info.get("old_narrator"))
@@ -959,82 +1142,93 @@ def run_once(args: argparse.Namespace,
                 print(f"  Новый author: {new_author_str!r}")
                 print(f"  Новый narrator: {new_narrator!r}")
 
-                # --- Reference title для защиты:
-                # По смыслу пользователя — ориентируемся на название,
-                # которое сейчас "имеется в ABS". Если теги уже дали новое название,
-                # используем его как более актуальное.
+                # Reference title для защиты
                 reference_title = (new_title or info.get("old_title") or "").strip()
 
-                # ---------------- FantLab -> Google fallback с проверкой ----------------
+                # ---------------- FantLab -> Google -> Audible ----------------
                 if args.use_fantlab:
                     should_try_provider = True
                     if use_cache and item_state.get("fantlab_applied") is True:
                         should_try_provider = False
 
                     if not should_try_provider:
-                        total_fantlab_skipped += 1
-                    else:
-                        search_title = new_title or info.get("old_title") or ""
-                        search_author = new_author_str or info.get("old_author")
+                        total_provider_skipped += 1
+                        continue
 
-                        # 1) FantLab
-                        fl_result = search_fantlab_book(
+                    search_title = new_title or info.get("old_title") or ""
+                    search_author = new_author_str or info.get("old_author")
+
+                    # 1) FantLab
+                    fl_result = search_fantlab_book(
+                        session,
+                        base_url,
+                        title=search_title,
+                        author=search_author,
+                        provider=args.fantlab_provider,
+                    )
+
+                    if use_cache:
+                        item_state["fantlab_attempts"] = int(item_state.get("fantlab_attempts") or 0) + 1
+                        item_state["fantlab_last_title"] = search_title
+                        item_state["fantlab_last_author"] = search_author
+
+                    # НОВОЕ: используем вариативную safety-проверку
+                    if fl_result and not provider_result_is_safe_variative(reference_title, search_author, fl_result, "FantLab"):
+                        fl_result = None
+
+                    if not fl_result:
+                        print("  [FantLab] Ничего безопасного не найдено. Пробуем Google Books...")
+
+                        # 2) Google Books
+                        gb_result = search_fantlab_book(
                             session,
                             base_url,
                             title=search_title,
                             author=search_author,
-                            provider=args.fantlab_provider,
+                            provider=args.google_provider,
                         )
 
-                        if use_cache:
-                            item_state["fantlab_attempts"] = int(item_state.get("fantlab_attempts") or 0) + 1
-                            item_state["fantlab_last_title"] = search_title
-                            item_state["fantlab_last_author"] = search_author
+                        if gb_result and not provider_result_is_safe_variative(reference_title, search_author, gb_result, "Google"):
+                            gb_result = None
 
-                        # Проверка совпадения названия
-                        if fl_result and not provider_result_is_safe(reference_title, fl_result, "FantLab"):
-                            fl_result = None
+                        if not gb_result:
+                            print("  [Google] Ничего безопасного не найдено. Пробуем Audible...")
 
-                        if not fl_result:
-                            print("  [FantLab] Ничего безопасного не найдено. Пробуем Google Books...")
-
-                            # 2) Google Books
-                            gb_result = search_fantlab_book(
+                            # 3) Audible
+                            ab_result = search_fantlab_book(
                                 session,
                                 base_url,
                                 title=search_title,
                                 author=search_author,
-                                provider=args.google_provider,
+                                provider=args.audible_provider,
                             )
 
-                            if gb_result and not provider_result_is_safe(reference_title, gb_result, "Google"):
-                                gb_result = None
+                            if ab_result and not provider_result_is_safe_variative(reference_title, search_author, ab_result, "Audible"):
+                                ab_result = None
 
-                            if not gb_result:
-                                print("  [Google] Ничего безопасного не найдено для этого заголовка.")
+                            if not ab_result:
+                                print("  [Audible] Ничего безопасного не найдено для этого заголовка.")
                                 if use_cache:
                                     item_state["fantlab_applied"] = False
                             else:
                                 print(
-                                    "  [Google] Найдено соответствие: "
-                                    f"{gb_result.get('title')!r} — {gb_result.get('author')!r}, "
-                                    f"год: {gb_result.get('publishedYear')}, "
-                                    f"жанры: {gb_result.get('genres')}"
+                                    "  [Audible] Найдено соответствие: "
+                                    f"{ab_result.get('title')!r} — {ab_result.get('author') or ab_result.get('authors')!r}"
                                 )
 
-                                gb_updates = build_fantlab_metadata_updates(gb_result)
-                                if gb_updates:
-                                    print(f"  [Google] Обновляем поля: {list(gb_updates.keys())}")
+                                ab_updates = build_fantlab_metadata_updates(ab_result)
+                                if ab_updates:
+                                    print(f"  [Audible] Обновляем поля: {list(ab_updates.keys())}")
                                     patch_book_metadata(
                                         session,
                                         base_url,
                                         item_id=item_id,
-                                        metadata_updates=gb_updates,
+                                        metadata_updates=ab_updates,
                                         dry_run=args.dry_run,
                                     )
-                                    total_google += 1
+                                    total_audible += 1
                                 else:
-                                    print("  [Google] В результате нет полей, которые нужно применить.")
+                                    print("  [Audible] В результате нет полей, которые нужно применить.")
 
                                 media = item.get("media") or {}
                                 existing_cover_path = media.get("coverPath")
@@ -1043,34 +1237,33 @@ def run_once(args: argparse.Namespace,
                                     session=session,
                                     base_url=base_url,
                                     item_id=item_id,
-                                    fantlab_cover_url=gb_result.get("cover"),
+                                    provider_cover_url=ab_result.get("cover"),
                                     existing_cover_path=existing_cover_path,
                                     dry_run=args.dry_run,
                                 )
 
                                 if use_cache:
                                     item_state["fantlab_applied"] = True
+
                         else:
                             print(
-                                "  [FantLab] Найдено соответствие: "
-                                f"{fl_result.get('title')!r} — {fl_result.get('author')!r}, "
-                                f"год: {fl_result.get('publishedYear')}, "
-                                f"жанры: {fl_result.get('genres')}"
+                                "  [Google] Найдено соответствие: "
+                                f"{gb_result.get('title')!r} — {gb_result.get('author') or gb_result.get('authors')!r}"
                             )
 
-                            fl_updates = build_fantlab_metadata_updates(fl_result)
-                            if fl_updates:
-                                print(f"  [FantLab] Обновляем поля: {list(fl_updates.keys())}")
+                            gb_updates = build_fantlab_metadata_updates(gb_result)
+                            if gb_updates:
+                                print(f"  [Google] Обновляем поля: {list(gb_updates.keys())}")
                                 patch_book_metadata(
                                     session,
                                     base_url,
                                     item_id=item_id,
-                                    metadata_updates=fl_updates,
+                                    metadata_updates=gb_updates,
                                     dry_run=args.dry_run,
                                 )
-                                total_fantlab += 1
+                                total_google += 1
                             else:
-                                print("  [FantLab] В результате нет полей, которые нужно применить.")
+                                print("  [Google] В результате нет полей, которые нужно применить.")
 
                             media = item.get("media") or {}
                             existing_cover_path = media.get("coverPath")
@@ -1079,7 +1272,7 @@ def run_once(args: argparse.Namespace,
                                 session=session,
                                 base_url=base_url,
                                 item_id=item_id,
-                                fantlab_cover_url=fl_result.get("cover"),
+                                provider_cover_url=gb_result.get("cover"),
                                 existing_cover_path=existing_cover_path,
                                 dry_run=args.dry_run,
                             )
@@ -1087,17 +1280,57 @@ def run_once(args: argparse.Namespace,
                             if use_cache:
                                 item_state["fantlab_applied"] = True
 
+                    else:
+                        print(
+                            "  [FantLab] Найдено соответствие: "
+                            f"{fl_result.get('title')!r} — {fl_result.get('author') or fl_result.get('authors')!r}"
+                        )
+
+                        fl_updates = build_fantlab_metadata_updates(fl_result)
+                        if fl_updates:
+                            print(f"  [FantLab] Обновляем поля: {list(fl_updates.keys())}")
+                            patch_book_metadata(
+                                session,
+                                base_url,
+                                item_id=item_id,
+                                metadata_updates=fl_updates,
+                                dry_run=args.dry_run,
+                            )
+                            total_fantlab += 1
+                        else:
+                            print("  [FantLab] В результате нет полей, которые нужно применить.")
+
+                        media = item.get("media") or {}
+                        existing_cover_path = media.get("coverPath")
+
+                        maybe_update_cover_from_fantlab(
+                            session=session,
+                            base_url=base_url,
+                            item_id=item_id,
+                            provider_cover_url=fl_result.get("cover"),
+                            existing_cover_path=existing_cover_path,
+                            dry_run=args.dry_run,
+                        )
+
+                        if use_cache:
+                            item_state["fantlab_applied"] = True
+
         print(f"\nИтого по библиотеке {lib_name!r}:")
         print(f"  Всего книг: {len(item_ids)}")
         print(f"  Книг обработано (теги и/или провайдеры): {total_touched}")
         print(f"  Пропуск обработки тегов по кешу: {total_tags_skipped}")
         print(f"  PATCH по тегам (или был бы в dry-run): {total_updates}")
         if args.use_fantlab:
-            print(f"  Пропуск поиска провайдера по кешу: {total_fantlab_skipped}")
-            print(f"  Книг, для которых применены метаданные FantLab: {total_fantlab}")
-            print(f"  Книг, для которых применены метаданные Google Books: {total_google}")
+            print(f"  Пропуск поиска провайдеров по кешу: {total_provider_skipped}")
+            print(f"  Применено FantLab: {total_fantlab}")
+            print(f"  Применено Google: {total_google}")
+            print(f"  Применено Audible: {total_audible}")
         print("")
 
+
+# ======================================================================
+# MAIN
+# ======================================================================
 
 def main() -> None:
     args = parse_args()
@@ -1110,9 +1343,10 @@ def main() -> None:
     print(f"  base_url          = {base_url!r}")
     print(f"  token             = {'<указан>' if args.token else '<НЕ указан>'}")
     print(f"  dry_run           = {args.dry_run}")
-    print(f"  use_fantlab       = {args.use_fantlab}")
+    print(f"  use_fantlab_chain = {args.use_fantlab}")
     print(f"  fantlab_provider  = {args.fantlab_provider!r}")
     print(f"  google_provider   = {args.google_provider!r}")
+    print(f"  audible_provider  = {args.audible_provider!r}")
     print(f"  cache             = {'включен' if use_cache else 'выключен'}")
     if use_cache:
         print(f"  cache_file        = {args.cache_file!r}")
@@ -1121,7 +1355,7 @@ def main() -> None:
 
     if not args.token:
         print("ВНИМАНИЕ: токен не указан (--token или ABS_TOKEN). "
-              "Если сервер требует авторизацию, запросы будут падать.\n")
+              "Если сервер требует авторизацию, запросы могут падать.\n")
 
     interval_min = DEFAULT_RUN_INTERVAL_MIN
 
@@ -1138,6 +1372,7 @@ def main() -> None:
             run_once(args, session, base_url, state, use_cache)
             if use_cache and not args.dry_run:
                 save_state(args.cache_file, state)
+
             print(f"\nОжидание {interval_min} минут до следующего запуска...")
             try:
                 time.sleep(interval_min * 60)
