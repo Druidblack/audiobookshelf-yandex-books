@@ -608,10 +608,16 @@ def is_title_compatible(reference_title: str, candidate_title: str) -> bool:
 # Мы НЕ меняем их логику и добавляем новые вариативные функции ниже.
 
 def _normalize_author_name(name: str) -> str:
+    # приводим к нижнему регистру
     name = (name or "").strip().lower()
+    # считаем "ё" и "е" одинаковыми
+    name = name.replace("ё", "е")
+    # выкидываем всё, кроме латиницы/кириллицы и пробелов
     name = re.sub(r"[^a-zа-яё\s]+", " ", name)
+    # схлопываем лишние пробелы
     name = re.sub(r"\s+", " ", name)
     return name.strip()
+
 
 
 def extract_author_names_from_result(result: Dict[str, Any]) -> List[str]:
@@ -710,10 +716,14 @@ _PATRONYMIC_SUFFIXES = (
 def _author_tokens(name: str) -> List[str]:
     """
     Токены имени автора без учета регистра, пунктуации и порядка слов.
+    Буквы "е" и "ё" считаем одинаковыми.
     """
     name = (name or "").strip().lower()
+    # уравниваем "ё" и "е" перед токенизацией
+    name = name.replace("ё", "е")
     tokens = re.findall(r"[a-zа-яё]+", name, flags=re.IGNORECASE)
     return [t for t in tokens if len(t) > 1]
+
 
 
 def _is_patronymic_token(token: str) -> bool:
