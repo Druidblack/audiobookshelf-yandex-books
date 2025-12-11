@@ -15,21 +15,6 @@ try:
 except ImportError:
     Image = None
 
-# ======================================================================
-# ПЕРЕМЕННЫЕ СРЕДЫ
-# ======================================================================
-#   ABS_BASE_URL=http://localhost:13378
-#   ABS_TOKEN=ВАШ_ТОКЕН
-#   ABS_DRY_RUN=1
-#   ABS_USE_FANTLAB=1
-#
-# КЕШ:
-#   ABS_CACHE_FILE=abs_metadata_state.json
-#   ABS_DISABLE_CACHE=1
-#
-# ИНТЕРВАЛ:
-#   ABS_RUN_INTERVAL_MINUTES=0  (0 = однократный запуск)
-# ======================================================================
 
 ABS_BASE_URL_ENV = os.environ.get("ABS_BASE_URL", "http://192.168.1.161:16378")
 ABS_TOKEN_ENV = os.environ.get(
