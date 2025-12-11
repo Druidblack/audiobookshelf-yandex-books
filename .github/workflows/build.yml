@@ -27,5 +27,5 @@ jobs:
           file: Dockerfile
           pull: true
           tags: |
-            ghcr.io/druidblack/audiobookshelf-yandex-books:latest
-            ghcr.io/druidblack/audiobookshelf-yandex-books:${{ github.sha }}
+            ghcr.io/druidblack/audiobookshelf_namer:latest
+            ghcr.io/druidblack/audiobookshelf_namer:${{ github.sha }}
