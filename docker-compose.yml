@@ -29,6 +29,9 @@ services:
       ABS_CACHE_FILE: "/data/abs_metadata_state.json"
       ABS_DISABLE_CACHE: "0"
 
+      # Путь к лог файлу
+      ABS_LOG_FIL: "/data/fix_abs_metadata.log"
+
       # Интервал между запусками (минуты). 0 — один проход и выход.
       ABS_RUN_INTERVAL_MINUTES: "60"
 
