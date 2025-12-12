@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  audiobookshelf_namer:
+    image: ghcr.io/druidblack/audiobookshelf_namer:latest
+    container_name: audiobookshelf_namer
+    restart: unless-stopped
+
+    # Если ABS крутится в Docker — удобно положить оба сервиса в одну сеть
+    # и обратиться к нему по имени контейнера, напр. http://audiobookshelf:80
+    environment:
+      # Адрес Audiobookshelf
+      # Пример для отдельного контейнера ABS в той же сети:
+      # ABS_BASE_URL: "http://audiobookshelf:80"
+      # Пример для уже работающего ABS на хосте:
+      ABS_BASE_URL: "http://192.168.1.161:16378"
+
+      # API-токен Audiobookshelf (лучше сделать отдельный API key только с нужными правами)
+      ABS_TOKEN: "ПОДСТАВЬ_СВОЙ_ABS_API_TOKEN"
+
+      # 1 = только показывать изменения, ничего не писать в ABS
+      # 0 = реально вносить правки
+      ABS_DRY_RUN: "0"
+
+      # Включать цепочку провайдеров (FantLab → Google Books → Audible)
+      ABS_USE_FANTLAB: "1"
+
+      # Путь к json с кэшем состояния — кладём в том, что бы не терять между рестартами
+      ABS_CACHE_FILE: "/data/abs_metadata_state.json"
+      ABS_DISABLE_CACHE: "0"
+
+      # Интервал между запусками (минуты). 0 — один проход и выход.
+      ABS_RUN_INTERVAL_MINUTES: "60"
+
+      # Ждать окончания сканирования библиотеки в ABS
+      ABS_WAIT_SCAN: "1"
+      # Интервал проверки задач ABS, сек
+      ABS_SCAN_CHECK_INTERVAL: "10"
+
+    volumes:
+      # Тут будет кэш состояния и, если нужно, ещё какие-то файлы
+      - ./abs-namer-data:/data
